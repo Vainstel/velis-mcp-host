@@ -6,7 +6,7 @@ It uses langgraph.prebuilt.create_react_agent to create the agent.
 import asyncio
 import contextlib
 from asyncio import Event
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -40,9 +40,8 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.managed import IsLastStep, RemainingSteps
-from langgraph.prebuilt.tool_node import ToolCallRequest, ToolNode
+from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.store.base import BaseStore
-from langgraph.types import Command
 from langgraph.utils.runnable import RunnableCallable  # type: ignore
 from pydantic import BaseModel
 
@@ -138,31 +137,39 @@ def complete_tool_calls(
     return messages
 
 
-def tool_call_wrapper(
-    req: ToolCallRequest, func: Callable[[ToolCallRequest], ToolMessage | Command]
-) -> ToolMessage | Command:
-    """Tool call wrapper to include tool call id in runtime config."""
-    if "metadata" in req.runtime.config:
-        req.runtime.config["metadata"]["tool_call_id"] = req.tool_call["id"]
-    else:
-        req.runtime.config["metadata"] = {
-            "tool_call_id": req.tool_call["id"],
-        }
-    return func(req)
+class HackedToolNode(ToolNode):
+    """hacked tool node to inject tool_call_id into the config.
 
+    This is a hack. If langgraph support tool_call_id, we will remove this class.
+    """
 
-async def atool_call_wrapper(
-    req: ToolCallRequest,
-    func: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
-) -> ToolMessage | Command:
-    """Tool call wrapper to include tool call id in runtime config."""
-    if "metadata" in req.runtime.config:
-        req.runtime.config["metadata"]["tool_call_id"] = req.tool_call["id"]
-    else:
-        req.runtime.config["metadata"] = {
-            "tool_call_id": req.tool_call["id"],
-        }
-    return await func(req)
+    async def _arun_one(
+        self,
+        call: ToolCall,
+        input_type: Literal["list", "dict", "tool_calls"],
+        config: RunnableConfig,
+    ) -> ToolMessage:
+        if "metadata" in config:
+            config["metadata"]["tool_call_id"] = call["id"]
+        else:
+            config["metadata"] = {
+                "tool_call_id": call["id"],
+            }
+        return await super()._arun_one(call, input_type, config)
+
+    def _run_one(
+        self,
+        call: ToolCall,
+        input_type: Literal["list", "dict", "tool_calls"],
+        config: RunnableConfig,
+    ) -> ToolMessage:
+        if "metadata" in config:
+            config["metadata"]["tool_call_id"] = call["id"]
+        else:
+            config["metadata"] = {
+                "tool_call_id": call["id"],
+            }
+        return super()._run_one(call, input_type, config)
 
 
 class InterruptableModel(BaseChatModel):
@@ -296,15 +303,7 @@ class ChatAgentFactory(AgentFactory[AgentState]):
         """Initialize the chat agent factory."""
         self._model = model
         self._model_class = type(model).__name__
-        self._tools: ToolNode = (
-            tools
-            if isinstance(tools, ToolNode)
-            else ToolNode(
-                tools,
-                wrap_tool_call=tool_call_wrapper,
-                awrap_tool_call=atool_call_wrapper,
-            )
-        )
+        self._tools = tools
         self._tools_in_prompt = tools_in_prompt
         self._response_format: (
             StructuredResponseSchema | tuple[str, StructuredResponseSchema] | None
@@ -326,40 +325,14 @@ class ChatAgentFactory(AgentFactory[AgentState]):
         self._tool_prompt: Runnable = get_prompt_runnable(None)
 
         # Initialize the tool prompt
-        if self._tools_in_prompt and isinstance(self._tools, ToolNode):
-            tools = list(self._tools.tools_by_name.values())
-            self._tool_prompt = get_prompt_runnable(tools_prompt(tools))
+        if self._tools_in_prompt:
+            if isinstance(self._tools, ToolNode):
+                tools = list(self._tools.tools_by_name.values())
+                self._tool_prompt = get_prompt_runnable(tools_prompt(tools))
+            else:
+                self._tool_prompt = get_prompt_runnable(tools_prompt(self._tools))
 
         self._build_graph()
-
-    def create_config(
-        self,
-        *,
-        user_id: str,
-        thread_id: str,
-        max_input_tokens: int | None = None,
-        oversize_policy: Literal["window"] | None = None,
-        abort_signal: Event | None = None,
-        elicitation_manager: Any | None = None,
-        stream_writer: Any | None = None,
-        locale: str = "en",
-        mcp_reload_callback: Any | None = None,
-    ) -> RunnableConfig:
-        """Create a config for the agent."""
-        return {
-            "configurable": {
-                ConfigurableKey.THREAD_ID: thread_id,
-                ConfigurableKey.USER_ID: user_id,
-                ConfigurableKey.MAX_INPUT_TOKENS: max_input_tokens,
-                ConfigurableKey.OVERSIZE_POLICY: oversize_policy,
-                ConfigurableKey.ABORT_SIGNAL: abort_signal,
-                ConfigurableKey.ELICITATION_MANAGER: elicitation_manager,
-                ConfigurableKey.STREAM_WRITER: stream_writer,
-                ConfigurableKey.LOCALE: locale,
-                ConfigurableKey.MCP_RELOAD_CALLBACK: mcp_reload_callback,
-            },
-            "recursion_limit": 102,
-        }
 
     def _check_more_steps_needed(
         self, state: AgentState, response: BaseMessage
@@ -513,9 +486,13 @@ class ChatAgentFactory(AgentFactory[AgentState]):
         graph.add_node("agent", self._call_model)
         graph.add_edge("before_agent", "agent")
 
-        self._tool_classes = list(self._tools.tools_by_name.values())
-        graph.add_node("tools", self._tools)
-
+        tool_node = (
+            self._tools
+            if isinstance(self._tools, ToolNode)
+            else HackedToolNode(self._tools)
+        )
+        self._tool_classes = list(tool_node.tools_by_name.values())
+        graph.add_node("tools", tool_node)
         self._should_return_direct = {
             t.name for t in self._tool_classes if t.return_direct
         }
@@ -605,7 +582,6 @@ def drop_empty_messages(inpt: ChatPromptValue | list[BaseMessage]) -> list[BaseM
                 not message.content
                 and not message.tool_calls
                 and not message.invalid_tool_calls
-                and not message.chunk_position  # type: ignore
             ):
                 continue
         # ToolMessage, SystemMessage, HumanMessage needs to have content

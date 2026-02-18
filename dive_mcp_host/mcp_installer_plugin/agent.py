@@ -25,7 +25,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import MessagesState
 from langgraph.managed import IsLastStep, RemainingSteps  # noqa: TC002
-from langgraph.prebuilt.tool_node import ToolNode, ToolRuntime
+from langgraph.prebuilt.tool_node import ToolNode
 
 from dive_mcp_host.mcp_installer_plugin.events import (
     InstallerProgress,
@@ -164,15 +164,15 @@ class InstallerAgent:
                 self,
                 call: ToolCall,
                 input_type: Literal["list", "dict", "tool_calls"],
-                tool_runtime: ToolRuntime,
+                config: RunnableConfig,
             ) -> ToolMessage:
-                if "metadata" in tool_runtime.config:
-                    tool_runtime.config["metadata"]["tool_call_id"] = call["id"]
+                if "metadata" in config:
+                    config["metadata"]["tool_call_id"] = call["id"]
                 else:
-                    tool_runtime.config["metadata"] = {"tool_call_id": call["id"]}
+                    config["metadata"] = {"tool_call_id": call["id"]}
 
                 # Execute the tool (tools emit agent_tool_call/result events directly)
-                result = await super()._arun_one(call, input_type, tool_runtime)
+                result = await super()._arun_one(call, input_type, config)
                 return cast(ToolMessage, result)
 
         return InstallerToolNode(self.tools)

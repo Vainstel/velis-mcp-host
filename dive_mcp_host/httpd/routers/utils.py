@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
 from contextlib import AsyncExitStack, suppress
 from dataclasses import asdict, dataclass, field
 from hashlib import md5
-from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import urlparse
@@ -30,13 +29,11 @@ from starlette.datastructures import State
 from dive_mcp_host.host.agents.file_in_additional_kwargs import (
     DOCUMENTS_KEY,
     IMAGES_KEY,
-    OAP_MIN_COUNT,
 )
 from dive_mcp_host.host.agents.message_order import FAKE_TOOL_RESPONSE
 from dive_mcp_host.host.custom_events import (
     ToolAuthenticationRequired,
     ToolCallProgress,
-    ToolElicitationRequest,
 )
 from dive_mcp_host.host.errors import LogBufferNotFoundError
 from dive_mcp_host.host.store.base import FileType, StoreManagerProtocol
@@ -52,11 +49,8 @@ from dive_mcp_host.httpd.database.models import (
     Role,
 )
 from dive_mcp_host.httpd.routers.models import (
-    AgentToolCallContent,
-    AgentToolResultContent,
     AuthenticationRequiredContent,
     ChatInfoContent,
-    ElicitationRequestContent,
     ErrorContent,
     InteractiveContent,
     MessageInfoContent,
@@ -190,54 +184,6 @@ class TextContent:
         return asdict(cls(text=text))
 
 
-def _extract_text_from_message(message: HumanMessage) -> str:
-    """Extract plain text content from a HumanMessage.
-
-    This extracts the actual text content, ignoring the dict wrapper
-    that would otherwise inflate token counts.
-    """
-    if isinstance(message.content, str):
-        return message.content
-    if isinstance(message.content, list):
-        texts = []
-        for item in message.content:
-            if isinstance(item, str):
-                texts.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                texts.append(item.get("text", ""))
-        return "".join(texts)
-    return ""
-
-
-def count_user_message_tokens(message: HumanMessage | None) -> int:
-    """Count tokens for a user message based on actual text content.
-
-    This avoids inflated token counts caused by the dict wrapper format
-    used internally for message content.
-    """
-    if not message:
-        return 0
-    text = _extract_text_from_message(message)
-    # Use a simple HumanMessage with plain text for accurate counting
-    plain_message = HumanMessage(content=text)
-    return count_tokens_approximately([plain_message])
-
-
-def count_prompt_tokens(prompt: str | None) -> int:
-    """Count tokens for a prompt string using langchain's estimation.
-
-    Args:
-        prompt: The prompt string to count tokens for.
-
-    Returns:
-        The estimated token count.
-    """
-    if not prompt:
-        return 0
-    message = SystemMessage(content=prompt)
-    return count_tokens_approximately([message])
-
-
 @dataclass(slots=True)
 class ImageAndDocuments:
     """Structure that contains image and documents."""
@@ -266,8 +212,11 @@ class ContentHandler:
     async def invoke(self, msg: AIMessage) -> str:
         """Extract various types of content."""
         result = self._text_content(msg)
-        if image_content := await self._gemini_image(msg):
-            result = f"{result} {image_content}"
+        model_name = msg.response_metadata.get("model_name")
+
+        if model_name in {"gemini-2.5-flash-image-preview"}:
+            result = f"{result} {await self._gemini_25_image(msg)}"
+
         return result
 
     def _text_content(self, msg: AIMessage) -> str:
@@ -298,7 +247,7 @@ class ContentHandler:
             url = f"file://{url}"
         return url
 
-    async def _gemini_image(self, msg: AIMessage) -> str:
+    async def _gemini_25_image(self, msg: AIMessage) -> str:
         """Gemini will return base64 image content.
 
         {
@@ -350,11 +299,6 @@ class ChatProcessor:
         self._content_handler = ContentHandler(self.store)
         self.disable_dive_system_prompt = (
             app.model_config_manager.full_config.disable_dive_system_prompt
-            if app.model_config_manager.full_config
-            else False
-        )
-        self.enable_local_tools = (
-            app.model_config_manager.full_config.enable_local_tools
             if app.model_config_manager.full_config
             else False
         )
@@ -445,45 +389,12 @@ class ChatProcessor:
         )
 
         start = time.time()
-        try:
-            user_message, ai_message, current_messages, ttft = await self._process_chat(
-                chat_id,
-                query_message,
-                is_resend=regenerate_message_id is not None,
-                start_time=start,
-            )
-        except Exception as exc:
-            # Generate assistant message ID upfront for error recovery
-            placeholder_ai_message_id = str(uuid4())
-            # Send message_info even on error so client can retry
-            user_msg_id = (
-                query_message.id
-                if query_message and hasattr(query_message, "id")
-                else None
-            )
-            if user_msg_id:
-                # Create placeholder assistant message for retry support
-                async with self.app.db_sessionmaker() as session:
-                    db = self.app.msg_store(session)
-                    await db.create_message(
-                        NewMessage(
-                            chatId=chat_id,
-                            role=Role.ASSISTANT,
-                            messageId=placeholder_ai_message_id,
-                            content=f"<chat-error>{exc}</chat-error>",
-                        ),
-                    )
-                    await session.commit()
-                await self.stream.write(
-                    StreamMessage(
-                        type="message_info",
-                        content=MessageInfoContent(
-                            userMessageId=user_msg_id,
-                            assistantMessageId=placeholder_ai_message_id,
-                        ),
-                    )
-                )
-            raise
+        user_message, ai_message, current_messages, ttft = await self._process_chat(
+            chat_id,
+            query_message,
+            is_resend=regenerate_message_id is not None,
+            start_time=start,
+        )
         end = time.time()
         if ai_message is None:
             if title_await:
@@ -493,13 +404,7 @@ class ChatProcessor:
         assert ai_message.id
 
         # Calculate user message tokens early, before the loop
-        user_tokens = count_user_message_tokens(user_message)
-
-        # Calculate prompt tokens using langchain estimation
-        custom_prompt = self.app.prompt_config_manager.get_prompt(PromptKey.CUSTOM)
-        system_prompt = self.app.prompt_config_manager.get_prompt(PromptKey.SYSTEM)
-        custom_prompt_tokens = count_prompt_tokens(custom_prompt)
-        system_prompt_tokens = count_prompt_tokens(system_prompt)
+        user_tokens = count_tokens_approximately([user_message]) if user_message else 0
 
         if title_await:
             title = await title_await
@@ -513,9 +418,21 @@ class ChatProcessor:
             for message in current_messages:
                 assert message.id
                 if isinstance(message, HumanMessage):
-                    # User message no longer stores user_token
-                    # user_token is now stored in AIMessage
-                    pass
+                    # Update user message with resource_usage
+                    user_resource_usage = ResourceUsage(
+                        model="",  # User messages don't have a model
+                        total_input_tokens=0,
+                        total_output_tokens=0,
+                        user_token=user_tokens,
+                        time_to_first_token=0.0,
+                        tokens_per_second=0.0,
+                        total_run_time=0.0,
+                    )
+                    # Update the existing user message with resource_usage
+                    await db.update_message_resource_usage(
+                        message.id,
+                        user_resource_usage,
+                    )
                 elif isinstance(message, AIMessage):
                     # Get duration from metadata or calculate from timing
                     duration = None
@@ -560,8 +477,6 @@ class ChatProcessor:
                         else 0,
                         total_output_tokens=output_tokens,
                         user_token=user_tokens,
-                        custom_prompt_token=custom_prompt_tokens,
-                        system_prompt_token=system_prompt_tokens,
                         time_to_first_token=message_ttft,
                         tokens_per_second=tokens_per_second,
                         total_run_time=duration,
@@ -645,8 +560,6 @@ class ChatProcessor:
             else 0,
             totalOutputTokens=output_tokens_count,
             userToken=user_tokens,
-            customPromptToken=custom_prompt_tokens,
-            systemPromptToken=system_prompt_tokens,
             totalTokens=ai_message.usage_metadata["total_tokens"]
             if ai_message.usage_metadata
             else 0,
@@ -662,8 +575,6 @@ class ChatProcessor:
                     else 0,
                     outputTokens=output_tokens_count,
                     userToken=user_tokens,
-                    customPromptToken=custom_prompt_tokens,
-                    systemPromptToken=system_prompt_tokens,
                     timeToFirstToken=ttft,
                     tokensPerSecond=tps,
                     modelName=ai_message.response_metadata.get("model")
@@ -698,21 +609,13 @@ class ChatProcessor:
         )
 
         # Calculate user message tokens
-        user_tokens = count_user_message_tokens(user_message)
-
-        # Calculate prompt tokens using langchain estimation
-        custom_prompt = self.app.prompt_config_manager.get_prompt(PromptKey.CUSTOM)
-        system_prompt = self.app.prompt_config_manager.get_prompt(PromptKey.SYSTEM)
-        custom_prompt_tokens = count_prompt_tokens(custom_prompt)
-        system_prompt_tokens = count_prompt_tokens(system_prompt)
+        user_tokens = count_tokens_approximately([user_message]) if user_message else 0
 
         usage = TokenUsage()
         if ai_message.usage_metadata:
             usage.total_input_tokens = ai_message.usage_metadata["input_tokens"]
             usage.total_output_tokens = ai_message.usage_metadata["output_tokens"]
             usage.user_token = user_tokens
-            usage.custom_prompt_token = custom_prompt_tokens
-            usage.system_prompt_token = system_prompt_tokens
             usage.total_tokens = ai_message.usage_metadata["total_tokens"]
 
         return str(ai_message.content), usage
@@ -760,7 +663,6 @@ class ChatProcessor:
             tools=tools,
             system_prompt=prompt,
             disable_default_system_prompt=self.disable_dive_system_prompt,
-            include_local_tools=self.enable_local_tools,
         )
         async with AsyncExitStack() as stack:
             if chat_id:
@@ -793,32 +695,13 @@ class ChatProcessor:
                 )
             )
 
-    # Tools that belong to installer agent (sub-agent)
-    # These are streamed as agent_tool_call/agent_tool_result, not tool_calls
-    _INSTALLER_AGENT_TOOLS = frozenset(
-        {
-            "fetch",
-            "bash",
-            "read_file",
-            "write_file",
-            "add_mcp_server",
-            "reload_mcp_server",
-            "request_confirmation",
-        }
-    )
-
     async def _stream_tool_calls_msg(self, message: AIMessage) -> None:
-        tool_calls = list(message.tool_calls)
-        if not tool_calls:
-            logger.debug("Skipping tool_calls - all are installer agent tools")
-            return
-
         await self.stream.write(
             StreamMessage(
                 type="tool_calls",
                 content=[
                     ToolCallsContent(name=c["name"], arguments=c["args"])
-                    for c in tool_calls
+                    for c in message.tool_calls
                 ],
             )
         )
@@ -919,45 +802,6 @@ class ChatProcessor:
                             ),
                         )
                     )
-                elif res_content[0] == ToolElicitationRequest.NAME:
-                    content = res_content[1]
-                    assert isinstance(content, ToolElicitationRequest)
-                    await self._stream_interactive_msg(
-                        InteractiveContent(
-                            type="elicitation_request",
-                            content=ElicitationRequestContent(
-                                request_id=content.request_id,
-                                message=content.message,
-                                requested_schema=content.requested_schema,
-                            ),
-                        )
-                    )
-                elif res_content[0] == "agent_tool_call":
-                    # Tool call from agent tools (installer tools)
-                    content = res_content[1]
-                    await self.stream.write(
-                        StreamMessage(
-                            type="agent_tool_call",
-                            content=AgentToolCallContent(
-                                tool_call_id=content.tool_call_id,
-                                name=content.name,
-                                args=content.args,
-                            ),
-                        )
-                    )
-                elif res_content[0] == "agent_tool_result":
-                    # Tool result from agent tools (installer tools)
-                    content = res_content[1]
-                    await self.stream.write(
-                        StreamMessage(
-                            type="agent_tool_result",
-                            content=AgentToolResultContent(
-                                tool_call_id=content.tool_call_id,
-                                name=content.name,
-                                result=content.result,
-                            ),
-                        )
-                    )
 
         # Find the most recent user and AI messages from newest to oldest
         user_message = next(
@@ -993,24 +837,6 @@ class ChatProcessor:
             logger.exception("Error generating title: %s", e)
         return "New Chat"
 
-    def _is_using_oap(self, files: list[str]) -> bool:
-        return (
-            len(files) >= OAP_MIN_COUNT
-            and len(files) % OAP_MIN_COUNT == 0
-            and self.store.is_local_file(files[0])
-            and self.store.is_url(files[1])
-        )
-
-    def _seperate_img_and_doc_oap(self, files: list[str]) -> ImageAndDocuments:
-        """OAP file order, [local_path, url, ... etc]."""
-        result = ImageAndDocuments()
-        for local_path, url in batched(files, 2):
-            if FileType.from_file_path(local_path) == FileType.IMAGE:
-                result.images.extend([local_path, url])
-                continue
-            result.documents.extend([local_path, url])
-        return result
-
     def _seperate_img_and_doc(self, files: list[str]) -> ImageAndDocuments:
         """File order, [local_path, local_path, ... etc]."""
         result = ImageAndDocuments()
@@ -1022,8 +848,6 @@ class ChatProcessor:
         return result
 
     def _extract_image_and_documents(self, files: list[str]) -> ImageAndDocuments:
-        if self._is_using_oap(files):
-            return self._seperate_img_and_doc_oap(files)
         return self._seperate_img_and_doc(files)
 
     async def _process_history_message(self, message: Message) -> HumanMessage:
@@ -1207,7 +1031,7 @@ def is_url(file_path: str) -> bool:
 
 
 def get_filename_remove_url(chat: ChatMessage) -> ChatMessage:
-    """Files sould remain their original name, urls created by OAP souldn't exist."""
+    """Files should remain their original name, remove any URLs."""
     for msg in chat.messages:
         files: list[str] = []
         for file in msg.files:
@@ -1239,8 +1063,6 @@ def calculate_token_usage(messages: list[Message]) -> TokenUsage | None:
     total_input_tokens = 0
     total_output_tokens = 0
     total_user_tokens = 0
-    total_custom_prompt_tokens = 0
-    total_system_prompt_tokens = 0
     total_tokens = 0
     time_to_first_token = 0.0
     weighted_tps_sum = 0.0
@@ -1250,8 +1072,6 @@ def calculate_token_usage(messages: list[Message]) -> TokenUsage | None:
             total_input_tokens += message.resource_usage.total_input_tokens
             total_output_tokens += message.resource_usage.total_output_tokens
             total_user_tokens += message.resource_usage.user_token
-            total_custom_prompt_tokens += message.resource_usage.custom_prompt_token
-            total_system_prompt_tokens += message.resource_usage.system_prompt_token
             # Calculate total tokens if not directly available
             total_tokens += (
                 message.resource_usage.total_input_tokens
@@ -1282,8 +1102,6 @@ def calculate_token_usage(messages: list[Message]) -> TokenUsage | None:
             totalInputTokens=total_input_tokens,
             totalOutputTokens=total_output_tokens,
             userToken=total_user_tokens,
-            customPromptToken=total_custom_prompt_tokens,
-            systemPromptToken=total_system_prompt_tokens,
             totalTokens=total_tokens,
             timeToFirstToken=time_to_first_token,
             tokensPerSecond=tokens_per_second,
