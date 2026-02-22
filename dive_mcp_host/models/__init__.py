@@ -68,9 +68,16 @@ def load_model(
             raise ValueError(
                 f"Additional arguments are not supported for {provider} provider.",
             )
+
+        # For OpenAI-compatible providers (including LiteLLM), enable usage metadata in streaming
+        cleaned_kwargs = clean_model_kwargs(provider, kwargs)
+        if provider == "openai" or provider == "openai_compatible":
+            if "stream_options" not in cleaned_kwargs:
+                cleaned_kwargs["stream_options"] = {"include_usage": True}
+
         model = init_chat_model(
             model=model_name,
             model_provider=provider,
-            **clean_model_kwargs(provider, kwargs),
+            **cleaned_kwargs,
         )
     return model
