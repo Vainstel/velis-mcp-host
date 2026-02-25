@@ -48,6 +48,7 @@ class MCPServerConfig(BaseModel):
         validate_by_name=True,
         validate_by_alias=True,
         serialize_by_alias=True,
+        extra="allow",
     )
 
     def model_post_init(self, _: Any) -> None:

@@ -1,1 +1,0 @@
-{"mcpServers":{"atlassian":{"transport":"sse","enabled":true,"url":"https://mcp.atlassian.com/v1/sse"},"airtable":{"enabled":true,"command":"npx","args":["-y","airtable-mcp-server"],"env":{"AIRTABLE_API_KEY":""}}}}
