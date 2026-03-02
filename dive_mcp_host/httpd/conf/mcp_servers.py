@@ -59,6 +59,12 @@ class MCPServerConfig(BaseModel):
         elif self.transport == "stdio" and self.command is None:
             raise ValueError("command is required for stdio transport")
 
+        # Expand ~ to home directory (works on macOS, Windows, Linux)
+        if self.command:
+            self.command = os.path.expanduser(self.command)
+        if self.args:
+            self.args = [os.path.expanduser(arg) for arg in self.args]
+
     @field_serializer("headers", when_used="always")
     def dump_headers(self, v: dict[str, SecretStr] | None) -> dict[str, str] | None:
         """Serialize the headers field to plain text."""
